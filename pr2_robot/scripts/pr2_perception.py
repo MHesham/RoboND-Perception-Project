@@ -191,7 +191,10 @@ def object_detection(cluster_indices, cloud_objects, white_cloud_objects):
             prediction_proba = clf.predict_proba(
                 scaler.transform(feature.reshape(1, -1)))
             rospy.loginfo(
-                'Prediction probabilities: {}'.format(prediction_proba))
+                'Prediction probabilities: {} for classes {}'.format(prediction_proba, encoder.classes_))
+            probability = np.max(prediction_proba)
+            rospy.loginfo(
+                'Detected {} with probability {}'.format(label, probability))
 
         # Publish a label into RViz
         x_sum, y_sum, z_sum = 0., 0., 0.
@@ -204,11 +207,12 @@ def object_detection(cluster_indices, cloud_objects, white_cloud_objects):
         n = len(pts_list)
         label_pos = [x_sum / n, y_sum / n, z_sum / n]
         label_pos[2] += .1
-        object_markers_pub.publish(make_label(label, label_pos, index))
+        marker_label = '{} {:0.2f}'.format(label, np.asscalar(probability))
+        object_markers_pub.publish(make_label(marker_label, label_pos, index))
 
         # Add the detected object to the list of detected objects.
         do = DetectedObject()
-        do.label = label
+        do.label = '{}'.format(label)
         do.cloud = ros_cluster
         detected_objects.append(do)
 
@@ -297,8 +301,8 @@ def pr2_mover(detected_object_list):
         do = get_detected_object_by_label(
             detected_object_list, pick_object_name)
         if do is None:
-            rospy.logerr('Object {} not found in detected objects {}'.format(
-                pick_object_name, detected_object_list))
+            rospy.logerr('Object {} not found in detected objects'.format(
+                pick_object_name))
             continue
 
         # Get the PointCloud for a given object and obtain it's centroid
