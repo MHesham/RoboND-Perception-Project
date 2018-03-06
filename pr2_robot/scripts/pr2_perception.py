@@ -29,7 +29,7 @@ import yaml
 
 VOXEL_LEAF_SIZE = 0.01
 PICK_PLACE_ENABLE = True
-TEST_SCENE_NUM = 1
+TEST_SCENE_NUM = 2
 DEBUG_SVM = True
 DEBUG_PERCEPTION = False
 PR2_STATE_MACHINE_ENABLE = True
@@ -108,13 +108,17 @@ class Pr2Perception:
 
     def update(self, pcl_cloud):
         self.pcl_cloud = pcl_cloud
+        t0 = rospy.get_time()
         self.filtering()
+        t1 = rospy.get_time()
         cluster_indices, pcl_cloud_objects = self.segmentation()
+        t2 = rospy.get_time()
         self.object_detection(cluster_indices, pcl_cloud_objects)
+        t3 = rospy.get_time()
+        rospy.loginfo('perception fltr: {}, segm: {}, objd: {}, total {}'.format(
+            t1 - t0, t2 - t1, t3 - t2, t3 - t0))
 
     def filtering(self):
-        time_start = time()
-
         # 1st PassThrough Filter to extract points on the table level
         passthrough_fltr = self.pcl_cloud.make_passthrough_filter()
         filter_axis = 'z'
@@ -152,12 +156,7 @@ class Pr2Perception:
             VOXEL_LEAF_SIZE, VOXEL_LEAF_SIZE, VOXEL_LEAF_SIZE)
         self.pcl_cloud = vox_fltr.filter()
 
-        rospy.loginfo('filtering elapsed time: {}s'.format(
-            time() - time_start))
-
     def segmentation(self):
-        time_start = time()
-
         # 2.1. RANSAC Plane Segmentation
         seg = self.pcl_cloud.make_segmenter()
         seg.set_model_type(pcl.SACMODEL_PLANE)
@@ -207,13 +206,9 @@ class Pr2Perception:
         self.pcl_table_pub.publish(self.ros_cloud_table)
         self.pcl_cluster_pub.publish(ros_cloud_cluster)
 
-        rospy.loginfo('segmentation elapsed time: {}s'.format(
-            time() - time_start))
-
         return cluster_indices, cloud_objects
 
     def object_detection(self, cluster_indices, cloud_objects):
-        time_start = time()
         do_labels = []
         self.detected_objects_list = []
 
@@ -259,9 +254,6 @@ class Pr2Perception:
             do.label = '{}'.format(label)
             do.cloud = ros_cluster
             self.detected_objects_list.append(do)
-
-        rospy.loginfo('object detection elapsed time: {}s'.format(
-            time() - time_start))
 
         # Publish the list of detected objects
         rospy.loginfo('Detected {} objects: {}'.format(
@@ -310,6 +302,9 @@ class Pr2StateMachine:
         self.ros_cloud_left_table = None
         self.ros_cloud_right_talbe = None
 
+        self.is_yaml_dict_collected = False
+        self.yaml_dict_list = []
+
         # Createy Service Proxies
         rospy.wait_for_service('clear_octomap')
         self.clear_octmap_srv = rospy.ServiceProxy('clear_octomap', Empty)
@@ -324,6 +319,7 @@ class Pr2StateMachine:
             group = dropbox_param[i]['group']
             pos = dropbox_param[i]['position']
             self.dropbox_dict[group] = {'name': name, 'position': pos}
+        rospy.loginfo('dropbox_dict: {}'.format(self.dropbox_dict))
 
     def update(self):
         rospy.loginfo('PR2 current state is {}'.format(self.state))
@@ -439,7 +435,6 @@ class Pr2StateMachine:
         return False
 
     def pick_place_object(self):
-        yaml_dict_list = []
         target_pick_place_param = PickPlaceSrvParam()
         target_object_found = False
 
@@ -454,7 +449,7 @@ class Pr2StateMachine:
 
             do = self.perception.get_detected_object_by_label(pick_object_name)
             if do is None:
-                rospy.logerr('Object {} not found in detected objects'.format(
+                rospy.logerr('Object {} not found in detected objects for pick operation'.format(
                     pick_object_name))
                 continue
 
@@ -480,25 +475,31 @@ class Pr2StateMachine:
             # Assign the arm to be used for pick_place_object. Valid values: right, left.
             pick_place_param.arm_name.data = self.dropbox_dict[pick_object_group]['name']
 
-            # Create a list of dictionaries (made with make_yaml_dict()) for later
-            # output to yaml format
-            yaml_dict = make_yaml_dict(
-                pick_place_param.test_scene_num,
-                pick_place_param.arm_name,
-                pick_place_param.object_name,
-                pick_place_param.pick_pose,
-                pick_place_param.place_pose)
-            yaml_dict_list.append(yaml_dict)
+            if not self.is_yaml_dict_collected:
+                # Create a list of dictionaries (made with make_yaml_dict()) for later
+                # output to yaml format
+                yaml_dict = make_yaml_dict(
+                    pick_place_param.test_scene_num,
+                    pick_place_param.arm_name,
+                    pick_place_param.object_name,
+                    pick_place_param.pick_pose,
+                    pick_place_param.place_pose)
+                self.yaml_dict_list.append(yaml_dict)
 
             if (target_object_found is False) and \
                     (pick_object_name not in self.picked_objects_set):
                 target_object_found = True
                 target_pick_place_param = pick_place_param
-            else:
+
+        for do in self.perception.detected_objects_list:
+            if do.label != target_pick_place_param.object_name:
                 self.collision_points_pub.publish(do.cloud)
 
-        # Output request parameters into output yaml file
-        send_to_yaml('output_{}.yaml'.format(TEST_SCENE_NUM), yaml_dict_list)
+        if not self.is_yaml_dict_collected:
+            # Output request parameters into output yaml file
+            send_to_yaml('output_{}.yaml'.format(
+                TEST_SCENE_NUM), self.yaml_dict_list)
+            self.is_yaml_dict_collected = True
 
         if (target_object_found is True) and PICK_PLACE_ENABLE:
             # Wait for 'pick_place_routine' service to come up
@@ -508,7 +509,7 @@ class Pr2StateMachine:
                 pick_place_routine = rospy.ServiceProxy(
                     'pick_place_routine', PickPlace)
 
-                assert target_pick_place_param.object_name not in self.picked_objects_set
+                assert target_pick_place_param.object_name.data not in self.picked_objects_set
                 resp = pick_place_routine(
                     target_pick_place_param.test_scene_num,
                     target_pick_place_param.object_name,
@@ -518,35 +519,28 @@ class Pr2StateMachine:
 
                 rospy.loginfo('Response: {}'.format(resp.success))
                 if resp.success is True:
+                    rospy.loginfo('{} picked successfully'.format(
+                        target_pick_place_param.object_name.data))
                     self.picked_objects_set.add(
-                        target_pick_place_param.object_name)
+                        target_pick_place_param.object_name.data)
 
             except rospy.ServiceException, e:
                 rospy.logerr('Service call failed: {}'.format(e))
 
 
-skip_frame = False
-
-
 def pcl_callback(pcl_msg):
-    global skip_frame
-    rospy.loginfo('### PCL BEGIN ###')
+    global frame_num
+
+    frame_num += 1
+    rospy.loginfo('### PCL BEGIN Frame{} ###'.format(frame_num))
 
     # Convert ROS msg to PCL data
     pcl_cloud = ros_to_pcl(pcl_msg)
-
-    time_start = time()
-
     pr2_perception.update(pcl_cloud)
-    if PR2_STATE_MACHINE_ENABLE:
-        if not skip_frame:
-            pr2_state_machine.update()
-            skip_frame = True
-        else:
-            skip_frame = False
+    if PR2_STATE_MACHINE_ENABLE and (frame_num % 2):
+        pr2_state_machine.update()
 
-    rospy.loginfo('### PCL END ## elapsed time: {}s'.format(
-        time() - time_start))
+    rospy.loginfo('### PCL END ##')
 
 # function to load parameters and request PickPlace service
 
@@ -558,7 +552,7 @@ if __name__ == '__main__':
 
     # Initialize color_list
     get_color_list.color_list = []
-
+    frame_num = 0
     pr2_perception = Pr2Perception()
     pr2_state_machine = Pr2StateMachine(pr2_perception)
 
