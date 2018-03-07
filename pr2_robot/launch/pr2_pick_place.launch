@@ -1,0 +1,6 @@
+<launch>
+  <node name="pr2_pick_place" pkg="pr2_robot" type="pr2_pick_place.py"
+    respawn="false" output="screen">
+    <param name="pr2_perception_model" value="$(find pr2_robot)/misc/model.sav"/>
+  </node>
+</launch>
