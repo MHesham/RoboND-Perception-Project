@@ -14,6 +14,8 @@ from sensor_stick.msg import DetectedObjectsArray
 from sensor_stick.msg import DetectedObject
 from pcl_helper import *
 from time import time
+import random
+import os
 
 import rospy
 import tf
@@ -33,11 +35,11 @@ import yaml
 DEBUG_SVM = False
 
 # Should match the launch file test scene number.
-TEST_SCENE_NUM = 2
+TEST_SCENE_NUM = 1
 
-# If True, enables the PR2 state-machine which is required for the perception
-# challenge and the PR2 motion, False otherwise.
-PR2_STATE_MACHINE_ENABLE = True
+# If True, enables the PR2 motion parto fo the PR2 state-machine which is
+# required for the perception challenge and the PR2 motion, False otherwise.
+PR2_MOTION_ENABLE = True
 
 # The index of the PR2 world joint in the joint_states. Used for rotating the
 # PR2 in-place. The index was figure out by dumping the pr2/joint_states msg.
@@ -51,6 +53,10 @@ PR2_ROTATE_RIGHT_ANGLE = -1.20
 
 # The angle in rad for the PR2 neutral pose.
 PR2_ROTATE_CENTER_ANGLE = 0.
+
+# Dropbox width and depth manually estimated by RViz using the Measure tool.
+DROPBOX_WIDTH = 0.28
+DROPBOX_DEPTH = 0.76
 
 
 def get_normals(cloud):
@@ -87,7 +93,7 @@ def send_to_yaml(yaml_filename, dict_list):
 def get_pcl_centroid(pcl_cloud):
     """Return the centroid of a PCL cloud."""
     # Get the PointCloud for a given object and obtain it's centroid
-    # Convert ROS point clound to a 2D numpy float32 array where each row is [x,y,z,rgb]
+    # Convert ROS point cloud to a 2D numpy float32 array where each row is [x,y,z,rgb]
     points_arr = pcl_cloud.to_array()
     # Compute the mean along the 1st dimension and extract the first 3 elements which
     # correspond to [x,y,z]
@@ -116,8 +122,12 @@ class Pr2Perception:
         # Create publishers
         self.pcl_objects_pub = rospy.Publisher(
             "/pcl_objects", PointCloud2, queue_size=1)
-        self.pcl_stat_outlier_removal_pub = rospy.Publisher(
-            '/stat_outlier_removal', PointCloud2, queue_size=1)
+        self.passthrough_fltr_pub = rospy.Publisher(
+            '/passthrough_fltr_output', PointCloud2, queue_size=1)
+        self.stat_outlier_fltr_pub = rospy.Publisher(
+            '/stat_outlier_fltr_output', PointCloud2, queue_size=1)
+        self.voxel_fltr_pub = rospy.Publisher(
+            "/voxel_fltr_output", PointCloud2, queue_size=1)
         self.pcl_table_pub = rospy.Publisher(
             "/pcl_table", PointCloud2, queue_size=1)
         self.pcl_cluster_pub = rospy.Publisher(
@@ -143,16 +153,16 @@ class Pr2Perception:
         """Update the perception pipeline with a new PCL cloud."""
         self.pcl_cloud = pcl_cloud
         t0 = rospy.get_time()
-        self.filtering()
+        self.__filtering()
         t1 = rospy.get_time()
-        cluster_indices, pcl_cloud_objects = self.segmentation()
+        cluster_indices, pcl_cloud_objects = self.__segmentation()
         t2 = rospy.get_time()
-        self.object_detection(cluster_indices, pcl_cloud_objects)
+        self.__object_detection(cluster_indices, pcl_cloud_objects)
         t3 = rospy.get_time()
         rospy.loginfo('perception fltr: {}, segm: {}, objd: {}, total {}'.format(
             t1 - t0, t2 - t1, t3 - t2, t3 - t0))
 
-    def filtering(self):
+    def __filtering(self):
         """Perform the filtering step of the perception pipeline."""
         # 1st PassThrough Filter to extract points on the table level
         passthrough_fltr = self.pcl_cloud.make_passthrough_filter()
@@ -172,6 +182,9 @@ class Pr2Perception:
         passthrough_fltr.set_filter_limits(axis_min, axis_max)
         self.pcl_cloud = passthrough_fltr.filter()
 
+        # Publish the result of applying passthrough filter on the z and y axes
+        self.passthrough_fltr_pub.publish(pcl_to_ros(self.pcl_cloud))
+
         # Statistical Outlier Filtering
         outlier_fltr = self.pcl_cloud.make_statistical_outlier_filter()
         # Set the number of neighboring points to analyze for any given point
@@ -182,8 +195,8 @@ class Pr2Perception:
         outlier_fltr.set_std_dev_mul_thresh(std_mul)
         self.pcl_cloud = outlier_fltr.filter()
 
-        ros_cloud = pcl_to_ros(self.pcl_cloud)
-        self.pcl_stat_outlier_removal_pub.publish(ros_cloud)
+        # Publish the result of removing point cloud noise
+        self.stat_outlier_fltr_pub.publish(pcl_to_ros(self.pcl_cloud))
 
         # Voxel Grid Downsampling
         vox_fltr = self.pcl_cloud.make_voxel_grid_filter()
@@ -191,9 +204,12 @@ class Pr2Perception:
             self.VOXEL_LEAF_SIZE, self.VOXEL_LEAF_SIZE, self.VOXEL_LEAF_SIZE)
         self.pcl_cloud = vox_fltr.filter()
 
-    def segmentation(self):
-        """Perform the segmetation step of the perception pipeline"""
-        # RANSAC Plane Segmentation to fit the data in a plane model to seperate
+        # Publish the result of down-sampling the point cloud
+        self.voxel_fltr_pub.publish(pcl_to_ros(self.pcl_cloud))
+
+    def __segmentation(self):
+        """Perform the segmentation step of the perception pipeline"""
+        # RANSAC Plane Segmentation to fit the data in a plane model to separate
         # the table and the objects.
         seg = self.pcl_cloud.make_segmenter()
         seg.set_model_type(pcl.SACMODEL_PLANE)
@@ -241,7 +257,7 @@ class Pr2Perception:
 
         return cluster_indices, cloud_objects
 
-    def object_detection(self, cluster_indices, cloud_objects):
+    def __object_detection(self, cluster_indices, cloud_objects):
         """Detect objects given PCL cloud objects and the cluster indices."""
         do_labels = []
         del self.detected_objects_list[:]
@@ -285,7 +301,7 @@ class Pr2Perception:
 
             # Publish the detected object label to RViz
             label_pos = get_pcl_centroid(pcl_cluster)
-            label_pos[2] += .1
+            label_pos[2] += .2
             self.object_markers_pub.publish(
                 make_label(marker_label, label_pos, index))
 
@@ -314,7 +330,7 @@ class Pr2Perception:
 
 
 class PickPlaceSrvParam:
-    """Encapsulte the pick_place_routine parameters and a task as well."""
+    """Encapsulate the pick_place_routine parameters and a task as well."""
 
     def __init__(self):
         self.test_scene_num = Int32()
@@ -334,7 +350,7 @@ class Pr2StateMachine:
     in the pick_list.
     """
 
-    # PR2 finite state machine states which follows the following state machine
+    # PR2 finite state machine states which follows the following state
     # transitions:
     # init -> explore-left: on initialization done
     # explore-left -> explore-right: on left table collision data collected
@@ -371,8 +387,9 @@ class Pr2StateMachine:
         self.yaml_dict_list = []
         self.task_list = []
         self.current_task_idx = 0
+        self.yam_output_written = False
 
-        # Createy proxy for the octmap clear service to be able to clear the
+        # Create a proxy for the octmap clear service to be able to clear the
         # MoveIt! collision map before each pick_place iteration
         rospy.wait_for_service('clear_octomap')
         self.clear_octmap_srv = rospy.ServiceProxy('clear_octomap', Empty)
@@ -381,7 +398,7 @@ class Pr2StateMachine:
         self.pick_object_list_param = rospy.get_param('/object_list')
 
         # Read in the dropbox data and reorganize it in a dictionary for easy
-        # and effecient data access
+        # and efficient data access
         dropbox_param = rospy.get_param('/dropbox')
         self.dropbox_dict = {}
         for i in range(len(dropbox_param)):
@@ -395,15 +412,15 @@ class Pr2StateMachine:
         rospy.loginfo('PR2 current state is {}'.format(self.state))
         previous_state = self.state
         if self.state == self.PR2_STATE_INIT:
-            self.update_init()
+            self.__update_init()
         elif self.state == self.PR2_STATE_EXPLORE_LEFT:
-            self.update_explore_left()
+            self.__update_explore_left()
         elif self.state == self.PR2_STATE_EXPLORE_RIGHT:
-            self.update_explore_right()
+            self.__update_explore_right()
         elif self.state == self.PR2_STATE_PLAN:
-            self.update_plan()
+            self.__update_plan()
         elif self.state == self.PR2_STATE_EXECUTE:
-            self.update_execute()
+            self.__update_execute()
         elif self.state != self.PR2_STATE_DONE:
             raise ValueError('undefined PR2 state')
 
@@ -411,44 +428,47 @@ class Pr2StateMachine:
             rospy.logwarn(
                 'PR2 state updated {} -> {}'.format(previous_state, self.state))
 
-    def clear_collision_map(self):
+    def __clear_collision_map(self):
         """Clears MoveIt! collision map and start from scratch"""
         try:
             self.clear_octmap_srv()
         except rospy.ServiceException, e:
             rospy.logerr('Service call failed: {}'.format(e))
 
-    def update_init(self):
+    def __update_init(self):
         """Update init state logic"""
-        self.clear_collision_map()
-        self.rotate_in_place(PR2_ROTATE_CENTER_ANGLE)
-        self.state = self.PR2_STATE_EXPLORE_LEFT
-
-    def update_explore_left(self):
-        """Update explore-left state logic"""
-        if not self.rotate_at_goal(PR2_ROTATE_LEFT_ANGLE):
-            self.rotate_in_place(PR2_ROTATE_LEFT_ANGLE)
+        if PR2_MOTION_ENABLE:
+            self.__clear_collision_map()
+            self.__rotate_in_place(PR2_ROTATE_CENTER_ANGLE)
+            self.state = self.PR2_STATE_EXPLORE_LEFT
         else:
-            assert self.rotate_at_goal(PR2_ROTATE_LEFT_ANGLE)
+            self.state = self.PR2_STATE_PLAN
+
+    def __update_explore_left(self):
+        """Update explore-left state logic"""
+        if not self.__rotate_at_goal(PR2_ROTATE_LEFT_ANGLE):
+            self.__rotate_in_place(PR2_ROTATE_LEFT_ANGLE)
+        else:
+            assert self.__rotate_at_goal(PR2_ROTATE_LEFT_ANGLE)
             assert self.perception.ros_cloud_table is not None
             rospy.logdebug('Capturing left table cloud')
             self.ros_cloud_left_table = self.perception.ros_cloud_table
-            self.rotate_in_place(PR2_ROTATE_CENTER_ANGLE)
+            self.__rotate_in_place(PR2_ROTATE_CENTER_ANGLE)
             self.state = self.PR2_STATE_EXPLORE_RIGHT
 
-    def update_explore_right(self):
+    def __update_explore_right(self):
         """Update explore-right state logic"""
-        if not self.rotate_at_goal(PR2_ROTATE_RIGHT_ANGLE):
-            self.rotate_in_place(PR2_ROTATE_RIGHT_ANGLE)
+        if not self.__rotate_at_goal(PR2_ROTATE_RIGHT_ANGLE):
+            self.__rotate_in_place(PR2_ROTATE_RIGHT_ANGLE)
         else:
-            assert self.rotate_at_goal(PR2_ROTATE_RIGHT_ANGLE)
+            assert self.__rotate_at_goal(PR2_ROTATE_RIGHT_ANGLE)
             assert self.perception.ros_cloud_table is not None
             rospy.logdebug('Capturing right table cloud')
             self.ros_cloud_right_table = self.perception.ros_cloud_table
-            self.rotate_in_place(PR2_ROTATE_CENTER_ANGLE)
+            self.__rotate_in_place(PR2_ROTATE_CENTER_ANGLE)
             self.state = self.PR2_STATE_PLAN
 
-    def update_plan(self):
+    def __update_plan(self):
         """Update plan state logic"""
         del self.task_list[:]
         self.current_task_idx = 0
@@ -477,7 +497,10 @@ class Pr2StateMachine:
             # Set object place pose
             pick_object_group = self.pick_object_list_param[i]['group']
             dropbox_pos = self.dropbox_dict[pick_object_group]['position']
-            pick_place_param.place_pose.position.x = dropbox_pos[0]
+            # Choose a random place in the dropbox along its depth
+            place_x = random.uniform(
+                dropbox_pos[0] - DROPBOX_DEPTH / 2, dropbox_pos[0])
+            pick_place_param.place_pose.position.x = place_x
             pick_place_param.place_pose.position.y = dropbox_pos[1]
             pick_place_param.place_pose.position.z = dropbox_pos[2]
 
@@ -497,19 +520,25 @@ class Pr2StateMachine:
 
         # Transition to execute state with a non-empty task list
         if len(self.task_list) > 0:
-            self.state = self.PR2_STATE_EXECUTE
-            # Output request parameters into output yaml file
-            send_to_yaml('output_{}.yaml'.format(
-                TEST_SCENE_NUM), self.yaml_dict_list)
+            if not self.yam_output_written:
+                cwd = os.getcwd()
+                rospy.logwarn('writing output_{}.yaml from {}'.format(
+                    TEST_SCENE_NUM, cwd))
+                # Output request parameters into output yaml file
+                send_to_yaml('output_{}.yaml'.format(
+                    TEST_SCENE_NUM), self.yaml_dict_list)
+                self.yam_output_written = True
+            if PR2_MOTION_ENABLE:
+                self.state = self.PR2_STATE_EXECUTE
 
-    def publish_collision_cloud(self, excluded_object):
+    def __publish_collision_cloud(self, excluded_object):
         """Publish the necessary collision data to MoveIt!
 
         Args:
             excluded_object: name of the detected object to exclude from
             publishing its cloud. Usually that's the object to be picked next
         """
-        self.clear_collision_map()
+        self.__clear_collision_map()
         assert self.ros_cloud_left_table is not None
         self.pcl_left_table_pub.publish(self.ros_cloud_left_table)
         self.collision_points_pub.publish(self.ros_cloud_left_table)
@@ -525,7 +554,7 @@ class Pr2StateMachine:
                 rospy.logwarn('publish {} collision data'.format(do.label))
                 self.collision_points_pub.publish(do.cloud)
 
-    def update_execute(self):
+    def __update_execute(self):
         """Update the execute state logic"""
 
         # In case of a non-empty task list, execute the next task, otherwise
@@ -533,7 +562,7 @@ class Pr2StateMachine:
         if self.current_task_idx < len(self.task_list):
             task = self.task_list[self.current_task_idx]
 
-            self.publish_collision_cloud(task.object_name.data)
+            self.__publish_collision_cloud(task.object_name.data)
 
             # Wait for 'pick_place_routine' service to come up
             rospy.wait_for_service('pick_place_routine')
@@ -559,7 +588,7 @@ class Pr2StateMachine:
         else:
             self.state = self.PR2_STATE_DONE
 
-    def rotate_at_goal(self, goal_j1):
+    def __rotate_at_goal(self, goal_j1):
         """Check if the PR2 is rotated in-place within tolerance.
 
         Args:
@@ -571,10 +600,10 @@ class Pr2StateMachine:
         joint_state = rospy.wait_for_message(
             '/pr2/joint_states', JointState)
         curr_j1 = joint_state.position[PR2_WORLD_JOINT_IDX]
-        return Pr2StateMachine.rotate_at_goal_helper(curr_j1, goal_j1)
+        return Pr2StateMachine.__rotate_at_goal_helper(curr_j1, goal_j1)
 
     @staticmethod
-    def rotate_at_goal_helper(pos_j1, goal_j1):
+    def __rotate_at_goal_helper(pos_j1, goal_j1):
         """Check if 2 angles are close within tolerance.
 
         Args:
@@ -588,7 +617,7 @@ class Pr2StateMachine:
         result = abs(pos_j1 - goal_j1) <= abs(tolerance)
         return result
 
-    def rotate_in_place(self, pos_j1):
+    def __rotate_in_place(self, pos_j1):
         """Rotate the PR2 in-place.
 
         The method is a blocking call and won't return unless the rotation
@@ -604,7 +633,7 @@ class Pr2StateMachine:
                 '/pr2/joint_states', JointState)
 
             curr_j1 = joint_state.position[PR2_WORLD_JOINT_IDX]
-            if Pr2StateMachine.rotate_at_goal_helper(curr_j1, pos_j1):
+            if Pr2StateMachine.__rotate_at_goal_helper(curr_j1, pos_j1):
                 time_elapsed = joint_state.header.stamp - time_elapsed
                 break
 
@@ -625,7 +654,7 @@ def pcl_callback(pcl_msg):
     # Update the perception pipeline twice faster than the state-machine
     # It was found that updating both at the same rate result in the
     # state-machine operating sometimes on a stale PointCloud msgs
-    if PR2_STATE_MACHINE_ENABLE and (frame_num % 2):
+    if frame_num % 2:
         pr2_state_machine.update()
 
     rospy.loginfo('### PCL END ##')
